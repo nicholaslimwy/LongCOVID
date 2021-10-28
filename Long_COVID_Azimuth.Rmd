@@ -1,0 +1,545 @@
+---
+title: "Long COVID"
+output: html_document
+---
+```{r}
+library(AnVIL)
+library(Seurat)
+library(cowplot)
+library(ComplexHeatmap)
+library(data.table)
+library(dplyr)
+library(fgsea)
+#plan('multiprocess',workers=4)
+library(GGally)
+library(ggplot2)
+library(ggpubr)
+library(ggfortify)
+library(knitr)
+#library(MAST)
+#library(NMF)
+library(openxlsx)
+library(RColorBrewer)
+library(reshape2)
+library(rsvd)
+library(Seurat)
+library(SeuratDisk)
+#library(SingleR)
+library(stringr)
+library(tidyverse)
+```
+Prep Samples for Integration
+```{r}
+Idents(covid_pooled)<-covid_pooled$Sex
+female<-subset(covid_pooled,idents='Female')
+Idents(female)<-female$Virus
+unique(female$orig.ident)
+female<-subset(female,idents=c('Healthy','COVID'))
+female@meta.data
+
+colnames(female@meta.data)[which(names(female@meta.data) == "Virus")] <- "condition"
+female$condition<-gsub('COVID', 'Severe COVID', female$condition)
+
+fam_LC<-merge(LC_combi, y = LC_subset)
+
+saveRDS(female,'~/long_COVID_assist.rds')
+female<-readRDS('~/long_COVID_assist.rds')
+Idents(female)<-female$orig.ident
+female<-RenameIdents(female,`HIP002`='36',`HIP023`='49',`5-11`='65',`5-14`='69',`5-21`='57',`5-43`='47',`5-47`='46')
+female$age<-Idents(female)
+unique(female$orig.ident)
+female@meta.data
+```
+
+
+```{r}
+fam_LC<-readRDS('~/fam_LC.rds')
+fam_LC<-merge(fam_LC,female)
+
+fam_LC <- PercentageFeatureSet(fam_LC, pattern = "^MT-", col.name = "percent.mt")
+fam_LC <- PercentageFeatureSet(fam_LC, pattern = "^RPS", col.name = "percent.rps")
+fam_LC <- PercentageFeatureSet(fam_LC, pattern = "^RPL", col.name = "percent.rpl")
+
+temp<-fam_LC@meta.data
+
+fam_LC <- CreateSeuratObject(fam_LC@assays$RNA@counts)
+fam_LC@meta.data <- temp
+
+
+
+```
+
+
+```{r setup, include=FALSE}
+fam_LC <- NormalizeData(fam_LC,normalization.method='LogNormalize',scale.factor=10000)
+fam_LC <- FindVariableFeatures(fam_LC, selection.method='vst',nfeatures=5000)
+Idents(fam_LC)<-fam_LC$percent.mt
+fam_LC<-subset(fam_LC,percent.mt<25)
+
+fam_LC<-ScaleData(fam_LC,vars.to.regress=c("percent.mt"))
+fam_LC<-RunPCA(fam_LC,seed.use=42)
+fam_LC<-FindNeighbors(fam_LC,reduction='pca',dims=1:20)
+fam_LC<-FindClusters(fam_LC,resolution=0.6)
+fam_LC<-RunUMAP(fam_LC,reduction='pca',dims=1:20,seed.use=42)
+
+fam_LC_sct<-SCTransform(fam_LC, vars.to.regress = c("percent.mt", "percent.rps", "percent.rpl"),  assay='RNA',variable.features.n = 3000, verbose = FALSE, return.only.var.genes = TRUE)
+
+reference <- LoadH5Seurat("~/pbmc_multimodal.h5seurat")
+
+anchors <- FindTransferAnchors(
+  reference = reference,
+  query = fam_LC_sct,
+  normalization.method = "SCT",
+  reference.reduction = "pca",
+  dims = 1:50,
+  recompute.residuals=FALSE
+)
+sct_map <- MapQuery(
+  anchorset = anchors,
+  query = fam_LC_sct,
+  reference = reference,
+  refdata = list(
+    celltype.l1 = "celltype.l1",
+    celltype.l2 = "celltype.l2",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "pca", 
+  reduction.model = "wnn.umap")
+  
+saveRDS(sct_map,file="~/fam_LC.rds")
+
+gc()
+memory.limit(9999999999)
+reference <- LoadH5Seurat("~/pbmc_multimodal.h5seurat")
+anchors <- FindTransferAnchors(
+  reference = reference,
+  query = fam_LC,
+  normalization.method = "LogNormalize",
+  reference.reduction = "pca",
+  dims = 1:50,
+  recompute.residuals=FALSE
+)
+
+DefaultAssay(object = fam_LC)<-'RNA'
+fam_LC
+reference
+
+fam_LC@assays$predicted_ADT<-NULL
+
+gsutil_cp("~/fam_LC.rds","gs://fc-04ca6cbf-3105-47c5-ab50-3f60e0a541ad/fam_LC_hg19.rds")
+
+DimPlot(sct_map, reduction = "ref.umap", group.by = "predicted.celltype.l2",split.by = 'condition', label = TRUE, label.size = 3 ,repel = TRUE) + NoLegend()
+
+sct_map@meta.data
+```
+
+```{r}
+saveRDS(fam_LC,file="~/fam_LC.rds")
+
+fam_LC<-readRDS('~/fam_LC.rds') #Renamed and doublet's removed already
+
+# fam_LC$Broad_Name<-NULL
+# 
+# colnames(fam_LC@meta.data)[which(names(fam_LC@meta.data) == "predicted.celltype.l2")] <- "Broad_Name"
+# Idents(fam_LC)<-fam_LC$Broad_Name
+# fam_LC<-subset(fam_LC,idents='Doublet',invert=TRUE)
+
+p1 = DimPlot(fam_LC, reduction = "ref.umap", group.by = "predicted.celltype.l1", label = TRUE, label.size = 3, repel = TRUE) + NoLegend()
+p2 = DimPlot(fam_LC, reduction = "ref.umap", group.by = "predicted.celltype.l2", label = TRUE, label.size = 3 ,repel = TRUE) + NoLegend()
+p3 = DimPlot(fam_LC, reduction = "umap", label = TRUE, label.size = 3 ,repel = TRUE) + NoLegend()
+
+
+DefaultAssay(fam_LC)<-'RNA'
+fam_LC <- NormalizeData(fam_LC,normalization.method='LogNormalize',scale.factor=10000)
+fam_LC <- FindVariableFeatures(fam_LC, selection.method='vst',nfeatures=3000)
+fam_LC<-ScaleData(fam_LC,vars.to.regress=c("percent.mt"))
+fam_LC<-RunPCA(fam_LC,seed.use=42)
+fam_LC<-FindNeighbors(fam_LC,reduction='pca',dims=1:20)
+fam_LC<-FindClusters(fam_LC,resolution=0.6)
+#fam_LC<-RunUMAP(fam_LC,reduction='pca',dims=1:20,seed.use=42)
+
+
+# fam_LCmarkers<-FindAllMarkers(fam_LC,min.pct=0.25,logfc.threshold = 0.25)
+# fam_LCclusters<-fam_LCmarkers %>% group_by(cluster) %>%top_n(n=20,wt=avg_log2FC)
+
+fam_LC@meta.data
+
+```
+Condense some groups into bigger numbers for better comparison
+```{r}
+Idents(fam_LC)<-fam_LC$Broad_Name
+fam_LC$Broad_Name<-gsub(c('CD4 CTL|CD4 Proliferating|CD4 Naive|CD4 TCM|CD4 TEM'), 'CD4', fam_LC$Broad_Name)
+fam_LC$Broad_Name<-gsub('CD8 Naive|CD8 TCM|CD8 TEM', 'CD8', fam_LC$Broad_Name)
+fam_LC$Broad_Name<-gsub('B intermediate|B memory|B naive', 'B', fam_LC$Broad_Name)
+fam_LC$Broad_Name<-gsub('NK Proliferating|NK_CD56bright', 'NK', fam_LC$Broad_Name)
+
+
+fam_LC$sex<-factor(fam_LC$sex,levels=c('M','F'))
+fam_LC$age <- as.numeric(fam_LC$age)
+
+celltype<-c('CD4','CD8','MAIT','B','CD14 Mono','CD16 Mono','NK','pDC')
+
+map(1:length(celltype), runMAST)
+
+celltype<-'Treg'
+
+table(fam_LC$condition)
+```
+Run Multi-GSEA
+```{r}
+pathways.hallmark <- gmtPathways("~/h.all.v7.2.symbols.gmt")
+Idents(fam_LC)<-fam_LC$Broad_Name
+map(1:length(celltype), multi_GSEA)
+
+res_final_rnk
+
+
+```
+
+```{r}
+fam_LC<-RunPCA(fam_LC,seed.use=42)
+DimPlot(fam_LC,reduction='pca',group.by='condition')
+
+Loadings(fam_LC[['pca']])
+
+fam_LC@reductions$pca@feature.loadings[,2]
+
+print(fam_LC[["pca"]], dims = 1:5, nfeatures = 5)
+
+
+assay.data <- GetAssay(object = fam_LC, assay = 'SCT')
+assay.data<-assay.data@data
+
+#write.xlsx(pca,"C:/Users/nicho/Dropbox/Goulder-Shalek/PNPs/Stim Pops/output/PCA variance genes.xlsx", rowNames=TRUE)
+
+#Convert pca list to dataframe. If needed
+#do.call(rbind.data.frame,pca)
+
+#If you want to look at other PCs
+#dfpca=cbind(metared,pca$x)
+#ggplot(dfpca)+geom_point(aes(x=PC1,y=PC2,color=Group.Abbreviation))
+
+p <- pca(assay.data, metadata = fam_LC@meta.data, removeVar = 0.1)
+
+
+
+eigencorplot(p,
+    metavars = c('Group','Sex','PID'))
+
+pairsplot(p,colby='Group')
+biplot(p,x = 'PC1', y = 'PC2',colby='Group',lab=NULL,legendPosition = 'right')
+
+plotloadings(p,
+    components = "PC2",
+    col = 'black',
+    drawConnectors = TRUE, labSize = 4)
+
+plotloadings(p,
+    components = getComponents(p,c(1,2)),
+    rangeRetain = 0.05, absolute = TRUE,
+    col = c('black', 'pink', 'red4'),
+    drawConnectors = FALSE, labSize = 4)
+  
+  
+plotloadings(p,
+    components = getComponents(p, seq_len(2)),
+    rangeRetain = 0.05,
+    labSize = 4.0,
+    absolute = FALSE,
+    title = 'Loadings plot',
+    subtitle = 'Misc PCs',
+    caption = 'Top 5% variables',
+    shape = 23, shapeSizeRange = c(1, 16),
+    col = c('white', 'pink'),
+    drawConnectors = FALSE)
+
+ggsave('~/loading_comps_PC2_CD8_PD1_top5.png')
+```
+
+To do
+
+IFN module scores
+Correlations with IFN 
+
+```{r}
+my_comparisons<-c('Healthy','Severe COVID','Control','Long Covid')
+general_prop<-covid.seuAbundances(fam_LC, by = 'Broad_Name', group_by = "condition", 
+                    meta.include = c("condition", "orig.ident", 
+                                     "sex"), 
+                    color_by = "orig.ident" , custom_fill_colors = c('#a45851', '#0f85a0', '#105c24','#000000'),
+                    group_by.point = "condition", comparisons = my_comparisons, 
+                    label.x = 2, pt.size = 3) + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.2))) + 
+  labs(color = "Condition", x = "Status") + 
+  theme(text = element_text(size = 10),axis.text.x=element_text(size=10),panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+general_prop
+
+ggsave('~/lc_cellprop.jpg',height=12,width=12)
+
+DimPlot(fam_LC, reduction = "ref.umap", group.by = "Broad_Name", label = TRUE, label.size = 3 ,repel = TRUE) + NoLegend()
+p2
+```
+Module Score
+```{r}
+IFN1.list <- read.delim('~/IFNab_reactomelist.txt')
+fam_LC$IFN1<-NULL
+plots = lapply(celltype,run_module_score)
+plot1<-do.call(plot_grid,  c(plots, align='v', ncol=3))
+ggsave("~/longCOVID_IFNScores.png",width=12,height=10,dpi=400)
+
+table(fam_LC$orig.ident,fam_LC$condition)
+```
+
+```{r}
+Idents(fam_LC)<-fam_LC$Broad_Name
+CD4_cell<-subset(fam_LC,idents=c('CD4'))
+CD4_cell<-SCTransform(CD4_cell, vars.to.regress = c("percent.mt", "percent.rps", "percent.rpl"), verbose = FALSE, return.only.var.genes = TRUE)
+CD4_cell<-NormalizeData(CD4_cell,normalization.method='LogNormalize',scale.factor=10000)
+CD4_cell <- FindVariableFeatures(CD4_cell, selection.method='vst',nfeatures=3000)
+CD4_cell<- ScaleData(CD4_cell,vars.to.regress=c("percent.mt"))
+CD4_cell<-RunPCA(CD4_cell)
+ElbowPlot(CD4_cell) #Choose number of PCs to use
+CD4_wgcna <- ProjectDim(CD4_cell, reduction='pca', dims.print=1:20)
+CD4.top.genes <- unlist(unique(TopFeatures(CD4_wgcna,reduction='pca',dim=17, nfeatures=2000, balanced=TRUE)))
+CD4_expr <-CD4_cell %>% GetAssayData(assay='RNA') %>%  as.data.frame.matrix() %>% rownames_to_column('gene')
+CD4_expr %>% filter(CD4_expr$gene %in% CD4.top.genes)
+CD4_cell@meta.data %>% as.data.frame.matrix()  %>% fwrite(row.names=TRUE, file = "~/Combined_sct_CD4traits.csv")
+
+options(stringsAsFactors = F)
+datExpr <- t(as.matrix(GetAssayData(CD4_cell,assay='RNA')))[,VariableFeatures(CD4_cell)]  # only use variable genes in analysis
+
+CD4_expr <-CD4_cell %>% GetAssayData(assay='RNA') %>%  as.data.frame.matrix() %>% rownames_to_column('gene')
+CD4_expr<-CD4_expr %>% filter(CD4_expr$gene %in% CD4.top.genes) %>% column_to_rownames('gene')
+
+datExpr<-as.data.frame(t(CD4_expr))
+
+
+gsg = goodSamplesGenes(datExpr, verbose = 3)
+gsg$allOK
+
+pca.res<-prcomp(datExpr, scale. = TRUE)
+cd4_meta<-CD4_cell@meta.data
+
+datExpr
+
+library(ggfortify)
+autoplot(pca.res, data=cd4_meta, colour="condition")  #input metadata as data
+
+```
+```{r}
+sampleTree = hclust(dist(datExpr), method = "average");
+# Plot the sample tree: Open a graphic output window of size 12 by 9 inches
+# The user should change the dimensions if the window is too large or too small.
+sizeGrWindow(12,9)
+#pdf(file = "Plots/sampleClustering.pdf", width = 12, height = 9);
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,
+     cex.axis = 1.5, cex.main = 2)
+
+# abline(h=24, col="red");
+# clust = cutreeStatic(sampleTree, cutHeight = 60, minSize = 10)
+# table(clust)
+# keepSamples = (clust==1)
+# datExpr = datExpr[keepSamples, ]
+# nGenes = ncol(datExpr)
+# nSamples = nrow(datExpr)
+
+
+powers = c(c(1:10), seq(from = 12, to=30, by=2))
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 5, networkType ="signed")
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2))
+cex1 = 0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit, signed R^2",type="n",main = paste("Scale independence"));text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],labels=powers,cex=cex1,col="red"); abline(h=0.80,col="red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5],xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+```
+
+```{r}
+cd4_samples<-rownames(datExpr)
+
+cd4_meta$condition[cd4_meta$condition=="Long Covid"]<-1
+cd4_meta$condition[cd4_meta$condition=="Control"]<-2
+cd4_meta$condition[cd4_meta$condition=="Healthy"]<-3
+cd4_meta$condition[cd4_meta$condition=="Severe COVID"]<-4
+
+usfTraits<-as.data.frame(cd4_meta[,c(2,5,6,7,8,9,10)])
+
+usfTraits<-binarizeCategoricalColumns.pairwise(usfTraits,convertColumns='condition')
+usfTraits$condition.3.vs.2<-NULL
+usfTraits$condition.4.vs.2<-NULL
+usfTraits$condition.4.vs.3<-NULL
+
+traitRows = match(cd4_samples, rownames(cd4_meta))
+
+datTraits = as.data.frame(usfTraits[traitRows, ]) #1 is Early, 2 is Late -- 7 LTNP, 11 Elite Controler
+rownames(datTraits) = cd4_samples
+
+datTraits[]<-lapply(datTraits, as.numeric)
+
+sampleTree2 = hclust(dist(datExpr), method = "average")
+traitColors = numbers2colors(datTraits, signed = TRUE);
+plotDendroAndColors(sampleTree2, traitColors, groupLabels = names(datTraits), main = "Sample dendrogram and trait heatmap")
+
+usfTraits
+```
+LC=1
+Ctrl=2
+Healthy=3
+Severe=4
+
+```{r}
+cor <- WGCNA::cor 
+#cor<-stats::cor
+# I have added networkType here
+net = blockwiseModules(datExpr, power = 9, networkType="signed", 
+                       TOMType = "signed", minModuleSize = 30,
+                       reassignThreshold = 0, mergeCutHeight = 0.45,
+                       numericLabels = TRUE, pamRespectsDendro = FALSE,
+                       saveTOMs = F,
+                       verbose = 3)
+sizeGrWindow(12, 9)
+mergedColors = labels2colors(net$colors)
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+moduleColors = labels2colors(net$colors)
+nGenes = ncol(datExpr);
+nSamples = nrow(datExpr);
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use = "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples);
+moduleTraitPadj = p.adjust(moduleTraitPvalue, method="fdr");
+sizeGrWindow(20,20)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3));
+
+moduleTraitCor_noME<-moduleTraitCor
+rownames(moduleTraitCor_noME)<-str_remove(rownames(moduleTraitCor_noME), "ME")
+cn = colnames(moduleTraitCor)
+
+#png(filename = "CD8_stim_heatmap.png",width=9,height=7,units='in',res=300)
+Heatmap(moduleTraitCor_noME, column_title="Module-trait heatmap", 
+        column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+        show_column_names = FALSE, 
+        cluster_rows = F,
+        bottom_annotation = HeatmapAnnotation(
+          text = anno_text(cn, rot = 0,location = unit(0.8, "npc"),just = "center"),
+          annotation_height = max_text_width(cn)),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf(textMatrix[i, j]), x, y, gp = gpar(fontsize = 8))})
+
+col_fun = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+lgd = Legend(col_fun = col_fun, title = "Correlation", direction = "horizontal", 
+             title_position = "lefttop")
+draw(lgd, x = unit(1, "cm"), y = unit(1, "cm"), just = c("left", "bottom"))
+
+#while (!is.null(dev.list()))  dev.off()
+
+modNames = substring(names(MEs), 3)
+geneModuleMembership = as.data.frame(cor(datExpr, MEs, use = "p"));
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples));
+names(geneModuleMembership) = paste("MM", modNames, sep="");
+names(MMPvalue) = paste("p.MM", modNames, sep="");
+geneTraitSignificance = as.data.frame(cor(datExpr, datTraits, use = "p"));
+GSPvalue = as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples));
+names(geneTraitSignificance) = paste("GS.", names(datTraits), sep="");
+names(GSPvalue) = paste("p.GS.", names(datTraits), sep="")
+
+```
+
+```{r}
+module_eigengenes <- net$MEs
+
+des_mat <- model.matrix(~ usfTraits$condition)
+fit <- limma::lmFit(t(module_eigengenes), design = des_mat)
+fit <- limma::eBayes(fit)
+stats_df <- limma::topTable(fit, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+head(stats_df)
+
+cd4_meta<-rownames_to_column(cd4_meta,var='Sample')
+
+module_df <- module_eigengenes %>%
+  tibble::rownames_to_column("Sample") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(cd4_meta %>%
+    dplyr::select(Sample, condition),
+  by = c("Sample" = "Sample")
+  )
+
+ggplot(
+  module_df,
+  aes(
+    x = condition,
+    y = ME1,
+    color = condition,label=Sample
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) + geom_label_repel(aes(label = Sample))+
+  theme_classic()
+
+gene_module_key <- tibble::enframe(net$colors, name = "gene", value = "module") %>%
+  # Let's add the `ME` part so its more clear what these numbers are and it matches elsewhere
+  dplyr::mutate(module = paste0("ME", module))
+
+turquoise_genes<-gene_module_key %>%
+  dplyr::filter(module == "ME3") %>% select(-module)
+
+module = "turquoise"
+column = match(module, modNames);
+moduleGenes = moduleColors==module;
+gene_set<-names(datExpr)[moduleColors==module]
+
+
+write.table(ME7_genes,'~/ME7_Black_genes.rnk',row.names = FALSE)
+
+write.table(ME2_Blue_genes,file = paste0(names(RNK[i]), ".RNK"),sep="\t",row.names = FALSE)
+#Slowprog=1
+
+make_module_heatmap(module_name = "ME2",expression_mat = datExpr,
+                                metadata_df = cd8_pd1_meta,
+                                gene_module_key_df = gene_module_key,
+                                module_eigengenes_df = module_eigengenes)
+
+datExpr
+metadata
+gene_module_key
+module_eigengenes
+
+ col_annot_df <- cd8_pd1_meta %>%
+    # Only select the treatment and sample ID columns
+    dplyr::select(Samples, Group, Sex) %>%
+    # Add on the eigengene expression by joining with sample IDs
+    dplyr::inner_join(module_eigengene, by = "Samples") %>%
+    # Arrange by patient and time point
+    dplyr::arrange(Group) %>%
+    # Store sample
+    tibble::column_to_rownames("Samples")
+ 
+cd8_pd1_meta$Sex[cd8_pd1$Sex=="2"]<-"Female"
+cd8_pd1_meta$Sex[cd8_pd1$Sex=="1"]<-"Male"
+cd8_pd1_meta$Group[cd8_pd1$Group=="2"]<-"Slow-Progressor"
+cd8_pd1_meta$Group[cd8_pd1$Group=="1"]<-"Progressor"
+
+head(module_eigengenes)
+
+modNames
+module = "black"
+column = match(module, modNames);
+moduleGenes = moduleColors==module;
+gene_set<-names(datExpr)[moduleColors==module]
+
+
+```
